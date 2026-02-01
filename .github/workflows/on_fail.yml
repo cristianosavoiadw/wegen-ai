@@ -3,17 +3,14 @@ name: Capture CI Failure
 on:
   workflow_run:
     workflows: ["Engine CI"]
-    types:
-      - completed
+    types: [completed]
 
 jobs:
-  on-fail:
+  capture:
     if: ${{ github.event.workflow_run.conclusion == 'failure' }}
     runs-on: ubuntu-latest
 
     steps:
       - name: Download logs
-        uses: actions/download-artifact@v3
-
-      - name: Show failure
-        run: echo "CI failed — ready for agent analysis"
+        run: |
+          echo "CI failed — logs will be captured by GitHub automatically"
