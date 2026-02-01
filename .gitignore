@@ -1,0 +1,14 @@
+# build do CMake
+build/
+
+# configs de IDE
+.idea/
+
+# modelos pesados
+models/*.gguf
+models/**/*.gguf
+
+# arquivos temporários
+*.o
+*.exe
+*.log
