@@ -31,6 +31,12 @@ add_executable(engine
 
         # Metrics
         src/metrics/power_linux.cpp
+        src/model/autoregressive_generator.h
+        src/model/autoregressive_generator.cpp
+        src/backend/cpu/ops_simd.h
+        src/backend/cpu/ops_simd.cpp
+
+
 )
 
 target_include_directories(engine PRIVATE

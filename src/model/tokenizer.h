@@ -3,14 +3,21 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <memory>
 
 namespace engine {
 
-// Tokenizer simplificado para Fase 3
-// Versão completa: integrar SentencePiece ou Tiktoken
+// Forward declaration
+struct TokenizerImpl;
+
 class SimpleTokenizer {
 public:
-    SimpleTokenizer() = default;
+    SimpleTokenizer();
+    ~SimpleTokenizer();
+
+    // Não copiável
+    SimpleTokenizer(const SimpleTokenizer&) = delete;
+    SimpleTokenizer& operator=(const SimpleTokenizer&) = delete;
 
     // Carrega vocabulário do modelo GGUF
     bool load_from_gguf(const std::string& model_path);
@@ -22,20 +29,23 @@ public:
     std::string decode(const std::vector<int32_t>& tokens) const;
 
     // Tokens especiais
-    int32_t bos_token() const { return bos_token_; }
-    int32_t eos_token() const { return eos_token_; }
-    int32_t pad_token() const { return pad_token_; }
+    int32_t bos_token() const;
+    int32_t eos_token() const;
+    int32_t pad_token() const;
 
     // Tamanho do vocabulário
-    size_t vocab_size() const { return vocab_.size(); }
+    size_t vocab_size() const;
 
 private:
-    std::vector<std::string> vocab_;
-    int32_t bos_token_ = 1;  // <s>
-    int32_t eos_token_ = 2;  // </s>
-    int32_t pad_token_ = 0;  // <pad>
+    std::unique_ptr<TokenizerImpl> impl_;
 
-    // Fallback: tokenização por espaço (TEMPORÁRIO)
+    // Internal methods
+    bool parse_gguf_vocab(void* base, size_t size);
+    bool parse_token_array(const uint8_t*& p, const uint8_t* end);
+    void skip_value(const uint8_t*& p, const uint8_t* end, uint32_t type);
+    bool load_fallback();
+
+    // Fallback: tokenização por espaço
     std::vector<int32_t> encode_whitespace(const std::string& text) const;
 };
 

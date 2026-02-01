@@ -5,6 +5,7 @@
 #include "model/gguf_loader.h"
 #include "model/tokenizer.h"
 #include "model/sampler.h"
+#include "model/autoregressive_generator.h"  // ← NOVO
 
 #include <vector>
 #include <memory>
@@ -32,11 +33,9 @@ struct TransformerLayer {
     // RoPE
     std::vector<float> rope_freqs;
 
-    // Dequant buffers for norm weights (F16 -> F32)
+    // Dequant buffers
     std::vector<float> attn_norm_dequant;
     std::vector<float> ffn_norm_dequant;
-
-    // Dequant buffers for linear weights
     std::vector<float> wq_dequant;
     std::vector<float> wk_dequant;
     std::vector<float> wv_dequant;
@@ -62,7 +61,7 @@ struct ModelConfig {
 };
 
 // ============================================================================
-// CPU Backend
+// CPU Backend (ATUALIZADO)
 // ============================================================================
 
 class CpuBackend final : public Backend {
@@ -75,10 +74,37 @@ public:
     void forward(const TensorView& in, TensorView& out) override;
     BackendStats stats() const override;
 
+    // ═══════════════════════════════════════════════════════════
+    // NOVA API - Geração com Generator
+    // ═══════════════════════════════════════════════════════════
+
+    // Gera texto usando AutoregressiveGenerator
     std::string generate(
         const std::string& prompt,
         int max_tokens = 50,
         const SamplingConfig& sampling = {}
+    );
+
+    // Gera com configuração avançada
+    std::string generate_advanced(
+        const std::string& prompt,
+        const GenerationConfig& config
+    );
+
+    // Acesso direto ao generator (para uso avançado)
+    AutoregressiveGenerator* generator() {
+        return generator_.get();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // DEPRECATED - Manter por compatibilidade temporária
+    // ═══════════════════════════════════════════════════════════
+
+    [[deprecated("Use generate() instead")]]
+    std::string generate_old(
+        const std::string& prompt,
+        int max_tokens,
+        const SamplingConfig& sampling
     );
 
 private:
@@ -87,7 +113,7 @@ private:
     GgufModel model_;
     ModelConfig config_;
 
-    // Weights (original or dequantized)
+    // Weights
     const float* token_embd_weight_ = nullptr;
     const float* output_norm_weight_ = nullptr;
     const float* output_weight_ = nullptr;
@@ -100,16 +126,20 @@ private:
     // Layers
     std::vector<TransformerLayer> layers_;
 
-    // Tokenizer & Sampler
+    // ═══════════════════════════════════════════════════════════
+    // NOVO - Componentes de geração
+    // ═══════════════════════════════════════════════════════════
+
     std::unique_ptr<SimpleTokenizer> tokenizer_;
     std::unique_ptr<Sampler> sampler_;
+    std::unique_ptr<AutoregressiveGenerator> generator_;  // ← NOVO
 
     // Working buffers
     std::vector<float> embed_buf_;
     std::vector<float> hidden_buf_;
     std::vector<float> logits_buf_;
 
-    // KV Cache (future optimization)
+    // KV Cache
     std::vector<float> k_cache_;
     std::vector<float> v_cache_;
     int kv_pos_ = 0;

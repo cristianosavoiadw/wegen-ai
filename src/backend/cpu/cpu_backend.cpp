@@ -95,6 +95,9 @@ void CpuBackend::init() {
         .vocab_size     = config_.n_vocab
     };
 }
+// ADICIONAR ESTA FUNÇÃO COMPLETA NO cpu_backend.cpp
+// Substituir a função dequantize_weights() existente (linhas ~98-163)
+
 void CpuBackend::dequantize_weights() {
     std::cout << "[cpu] dequantizing weights...\n";
 
@@ -156,9 +159,126 @@ void CpuBackend::dequantize_weights() {
         }
     }
 
-    // === LAYERS ===
-    std::cout << "[cpu] layer dequantization skipped (Phase 3.5)\n";
+    // === OUTPUT NORM ===
+    if (output_norm_weight_) {
+        auto type = model_.tensor_type("output_norm.weight");
+        if (type != GgmlType::F32) {
+            std::cout << "[cpu] dequantizing output_norm\n";
+            output_norm_dequant_.resize(config_.n_embd);
+            ops::dequantize_auto(
+                output_norm_dequant_.data(),
+                output_norm_weight_,
+                config_.n_embd,
+                type
+            );
+            output_norm_weight_ = output_norm_dequant_.data();
+        }
+    }
 
+    // === LAYERS ===
+    std::cout << "[cpu] dequantizing " << config_.n_layers << " layers (this may take a while)...\n";
+
+    for (uint32_t i = 0; i < config_.n_layers; ++i) {
+        auto& layer = layers_[i];
+        std::string prefix = "blk." + std::to_string(i) + ".";
+
+        // Helper lambda para dequantizar tensores
+        auto dequant_if_needed = [&](const float*& weight_ptr,
+                                      std::vector<float>& dequant_buffer,
+                                      const std::string& tensor_name,
+                                      size_t num_elements) {
+            if (!weight_ptr) return;
+
+            auto type = model_.tensor_type(tensor_name);
+            if (type != GgmlType::F32) {
+                dequant_buffer.resize(num_elements);
+                ops::dequantize_auto(
+                    dequant_buffer.data(),
+                    weight_ptr,
+                    num_elements,
+                    type
+                );
+                weight_ptr = dequant_buffer.data();
+            }
+        };
+
+        // Attention norm
+        dequant_if_needed(
+            layer.attn_norm_weight,
+            layer.attn_norm_dequant,
+            prefix + "attn_norm.weight",
+            config_.n_embd
+        );
+
+        // Attention projections (Q, K, V, O)
+        dequant_if_needed(
+            layer.wq,
+            layer.wq_dequant,
+            prefix + "attn_q.weight",
+            config_.n_embd * config_.n_embd
+        );
+
+        dequant_if_needed(
+            layer.wk,
+            layer.wk_dequant,
+            prefix + "attn_k.weight",
+            config_.n_embd * config_.n_embd
+        );
+
+        dequant_if_needed(
+            layer.wv,
+            layer.wv_dequant,
+            prefix + "attn_v.weight",
+            config_.n_embd * config_.n_embd
+        );
+
+        dequant_if_needed(
+            layer.wo,
+            layer.wo_dequant,
+            prefix + "attn_output.weight",
+            config_.n_embd * config_.n_embd
+        );
+
+        // FFN norm
+        dequant_if_needed(
+            layer.ffn_norm_weight,
+            layer.ffn_norm_dequant,
+            prefix + "ffn_norm.weight",
+            config_.n_embd
+        );
+
+        // FFN projections (w1, w2, w3)
+        const int ffn_dim = config_.n_embd * 4;  // Típico: 4x expansion
+
+        dequant_if_needed(
+            layer.w1,
+            layer.w1_dequant,
+            prefix + "ffn_gate.weight",
+            ffn_dim * config_.n_embd
+        );
+
+        dequant_if_needed(
+            layer.w2,
+            layer.w2_dequant,
+            prefix + "ffn_down.weight",
+            config_.n_embd * ffn_dim
+        );
+
+        dequant_if_needed(
+            layer.w3,
+            layer.w3_dequant,
+            prefix + "ffn_up.weight",
+            ffn_dim * config_.n_embd
+        );
+
+        // Progress update a cada 5 layers
+        if ((i + 1) % 5 == 0 || i == 0) {
+            std::cout << "[cpu] dequantized " << (i + 1) << "/"
+                      << config_.n_layers << " layers\n";
+        }
+    }
+
+    std::cout << "[cpu] all layers dequantized successfully\n";
     std::cout << "[cpu] dequantization complete\n";
 }
 
@@ -291,11 +411,10 @@ void CpuBackend::forward(const TensorView& in, TensorView& out) {
         ops::fill_f32(hidden_buf_.data(), 0.0f, config_.n_embd);
     }
 
-    // 2. SKIP LAYERS POR ENQUANTO (teste)
-    std::cout << "[cpu] WARNING: skipping layers (testing)\n";
-    // for (uint32_t i = 0; i < config_.n_layers; ++i) {
-    //     forward_layer(i, hidden_buf_.data(), 1);
-    // }
+    // 2. Process all transformer layers
+    for (uint32_t i = 0; i < config_.n_layers; ++i) {
+        forward_layer(i, hidden_buf_.data(), 1);
+    }
 
     // 3. Norm
     if (output_norm_weight_) {
