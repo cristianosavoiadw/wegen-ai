@@ -8,28 +8,26 @@
 namespace engine {
 
 /* -----------------------------
- * Tipos GGML
+ * Tipos GGML (compatível GGUF)
  * ----------------------------- */
-    enum class GgmlType : uint32_t {
-        F32     = 0,
-        F16     = 1,
-        Q4_0    = 2,
-        Q4_1    = 3,
-        // 4 e 5 reservados
-        Q5_0    = 6,
-        Q5_1    = 7,
-        Q8_0    = 8,
-        Q8_1    = 9,
-        Q2_K    = 10,
-        Q3_K    = 11,
-        Q4_K    = 12,   // ← ADICIONAR
-        Q5_K    = 13,   // ← ADICIONAR
-        Q6_K    = 14,   // ← ADICIONAR (esse é o tipo 14!)
-        Q8_K    = 15,   // ← ADICIONAR
-        IQ2_XXS = 16,
-        IQ2_XS  = 17,
-        // ... outros
-    };
+enum class GgmlType : uint32_t {
+    F32     = 0,
+    F16     = 1,
+    Q4_0    = 2,
+    Q4_1    = 3,
+    Q5_0    = 6,
+    Q5_1    = 7,
+    Q8_0    = 8,
+    Q8_1    = 9,
+    Q2_K    = 10,
+    Q3_K    = 11,
+    Q4_K    = 12,
+    Q5_K    = 13,
+    Q6_K    = 14,
+    Q8_K    = 15,
+    IQ2_XXS = 16,
+    IQ2_XS  = 17,
+};
 
 /* -----------------------------
  * Tensor metadata
@@ -49,31 +47,47 @@ struct GgufTensorInfo {
  * ----------------------------- */
 class GgufModel {
 public:
+    /* --- metadata principal --- */
     uint32_t context_length() const { return context_length_; }
     uint32_t embedding_dim()  const { return embedding_dim_; }
     uint32_t n_layers()       const { return n_layers_; }
 
-    // Acesso a tensores
+    /* --- acesso a tensores --- */
     const void* tensor_ptr(const std::string& name) const;
-
-    // NOVO: Obter tipo do tensor
     GgmlType tensor_type(const std::string& name) const;
-
-    // NOVO: Obter informação completa do tensor
     const GgufTensorInfo* tensor_info(const std::string& name) const;
 
     std::string summary() const;
 
+    /* --- tokenizer (do GGUF) --- */
+    const std::vector<std::string>& tokenizer_tokens() const { return tokenizer_tokens_; }
+    const std::vector<float>& tokenizer_scores() const { return tokenizer_scores_; }
+    const std::vector<int32_t>& tokenizer_types() const { return tokenizer_types_; }
+
+    int32_t bos_id() const { return bos_id_; }
+    int32_t eos_id() const { return eos_id_; }
+    int32_t unk_id() const { return unk_id_; }
+
 private:
     friend class GgufLoader;
 
+    /* --- metadata --- */
     uint32_t context_length_ = 0;
     uint32_t embedding_dim_  = 0;
     uint32_t n_layers_       = 0;
 
-    std::unordered_map<std::string, std::string> kv_;
+    /* --- tokenizer --- */
+    std::vector<std::string> tokenizer_tokens_;
+    std::vector<float> tokenizer_scores_;
+    std::vector<int32_t> tokenizer_types_;
+    int32_t bos_id_ = -1;
+    int32_t eos_id_ = -1;
+    int32_t unk_id_ = 0;
+
+    /* --- tensores --- */
     std::unordered_map<std::string, GgufTensorInfo> tensors_;
 
+    /* --- arquivo mapeado --- */
     void* file_base_ = nullptr;
     size_t file_size_ = 0;
 

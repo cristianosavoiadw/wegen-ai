@@ -48,7 +48,7 @@ void copy_f32(float* dst, const float* src, int n) {
     std::memcpy(dst, src, n * sizeof(float));
 }
 
-void fill_f32(float* dst, float value, int n) {
+void fill_f32(float* dst, float value, size_t n) {
     std::fill(dst, dst + n, value);
 }
 

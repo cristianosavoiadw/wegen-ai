@@ -1,6 +1,7 @@
 #include "backend/cpu/cpu_backend.h"
 #include "backend/cpu/ops.h"
 #include "backend/cpu/quants.h"
+#include "model/gguf_loader.h"
 
 #include <iostream>
 #include <chrono>
@@ -8,84 +9,73 @@
 
 namespace engine {
 
-// Declaração forward
+// forward
 namespace ops {
     void dequantize_auto(float* dst, const void* src, int n, GgmlType type);
 }
 
-CpuBackend::CpuBackend() = default;
-CpuBackend::~CpuBackend() = default;
+/* ================================================= */
 
-// ============================================================================
-// INICIALIZAÇÃO
-// ============================================================================
+CpuBackend::CpuBackend() = default;
+
+
+/* ================================================= */
 
 void CpuBackend::init() {
     std::cout << "[cpu] init()\n";
     last_stats_ = BackendStats{};
-
-    power_ok_ = power_.init();
-    if (!power_ok_) {
-        std::cout << "[cpu] powercap not available\n";
-    } else {
-        std::cout << "[cpu] energy path: " << power_.energy_path() << "\n";
-        auto joules = power_.read_joules();
-        if (joules) {
-            energy_start_ = *joules;
-        }
-    }
 }
 
-// ============================================================================
-// CARREGAMENTO DO MODELO
-// ============================================================================
+/* ================================================= */
+/* LOAD MODEL */
+/* ================================================= */
 
-    ModelInfo CpuBackend::load_model(const std::string& path) {
+ModelInfo CpuBackend::load_model(const std::string& path) {
+
     std::cout << "[cpu] loading model: " << path << "\n";
 
-    model_ = loader_.load(path);
+    model_ = GgufLoader::load(path);
+
     std::cout << "[cpu] " << model_.summary() << "\n";
 
-    // Configuração
-    config_.n_ctx = model_.context_length();
-    config_.n_embd = model_.embedding_dim();
-    config_.n_layers = model_.n_layers();
-    config_.n_vocab = 32000;
-    config_.n_heads = 32;
-    config_.n_kv_heads = 8;
+    /* ---- Config ---- */
+
+    config_.n_ctx     = model_.context_length();
+    config_.n_embd    = model_.embedding_dim();
+    config_.n_layers  = model_.n_layers();
+
+    config_.n_vocab     = 32000;
+    config_.n_heads     = 32;
+    config_.n_kv_heads  = 8;
 
     std::cout << "[cpu] config: "
               << "vocab=" << config_.n_vocab
               << " ctx=" << config_.n_ctx
-              << " embd=" << config_.n_embd
+              << " emb=" << config_.n_embd
               << " layers=" << config_.n_layers
               << " heads=" << config_.n_heads << "\n";
 
-    // Extrai pesos (ponteiros brutos)
+    /* ---- Extract raw weights ---- */
+
     extract_weights();
 
-    // NOVO: Dequantiza pesos se necessário
+    /* ---- Dequant ---- */
+
     dequantize_weights();
 
-    // Inicializa RoPE
-    init_rope_freqs();
+    /* ---- Buffers ---- */
 
-    // Aloca buffers
     embed_buf_.resize(config_.n_embd);
     hidden_buf_.resize(config_.n_embd);
     logits_buf_.resize(config_.n_vocab);
 
-    // KV Cache
-    size_t kv_cache_size = config_.n_layers * config_.n_ctx * config_.n_embd;
-    k_cache_.resize(kv_cache_size, 0.0f);
-    v_cache_.resize(kv_cache_size, 0.0f);
+    /* ---- KV cache ---- */
+
+    size_t kv_size = config_.n_layers * config_.n_ctx * config_.n_embd;
+
+    k_cache_.resize(kv_size, 0.0f);
+    v_cache_.resize(kv_size, 0.0f);
     kv_pos_ = 0;
-
-    // Tokenizer e sampler
-    tokenizer_ = std::make_unique<SimpleTokenizer>();
-    tokenizer_->load_from_gguf(path);
-
-    sampler_ = std::make_unique<Sampler>();
 
     std::cout << "[cpu] model loaded successfully\n";
 
@@ -95,20 +85,25 @@ void CpuBackend::init() {
         .vocab_size     = config_.n_vocab
     };
 }
-// ADICIONAR ESTA FUNÇÃO COMPLETA NO cpu_backend.cpp
-// Substituir a função dequantize_weights() existente (linhas ~98-163)
+
+/* ================================================= */
+/* DEQUANT */
+/* ================================================= */
 
 void CpuBackend::dequantize_weights() {
+
     std::cout << "[cpu] dequantizing weights...\n";
 
-    // === TOKEN EMBEDDING ===
+    /* ---- token embedding ---- */
+
     if (token_embd_weight_) {
+
         auto type = model_.tensor_type("token_embd.weight");
 
         if (type != GgmlType::F32) {
-            std::cout << "[cpu] dequantizing token_embd (type=" << static_cast<int>(type) << ")\n";
 
-            size_t size = config_.n_vocab * config_.n_embd;
+            size_t size = (size_t)config_.n_vocab * config_.n_embd;
+
             token_embd_dequant_.resize(size);
 
             ops::dequantize_auto(
@@ -119,30 +114,19 @@ void CpuBackend::dequantize_weights() {
             );
 
             token_embd_weight_ = token_embd_dequant_.data();
-            std::cout << "[cpu] token_embd dequantized: " << size << " elements\n";
-        } else {
-            std::cout << "[cpu] token_embd already F32\n";
         }
     }
 
-    // === OUTPUT WEIGHT ===
+    /* ---- output ---- */
+
     if (output_weight_) {
-        GgmlType type = GgmlType::F32;
-        const char* tensor_name = nullptr;
 
-        if (model_.tensor_info("output.weight")) {
-            tensor_name = "output.weight";
-            type = model_.tensor_type("output.weight");
-        } else if (model_.tensor_info("lm_head.weight")) {
-            tensor_name = "lm_head.weight";
-            type = model_.tensor_type("lm_head.weight");
-        }
+        auto type = model_.tensor_type("output.weight");
 
-        if (tensor_name && type != GgmlType::F32) {
-            std::cout << "[cpu] dequantizing " << tensor_name
-                      << " (type=" << static_cast<int>(type) << ")\n";
+        if (type != GgmlType::F32) {
 
-            size_t size = config_.n_embd * config_.n_vocab;
+            size_t size = (size_t)config_.n_vocab * config_.n_embd;
+
             output_dequant_.resize(size);
 
             ops::dequantize_auto(
@@ -153,291 +137,192 @@ void CpuBackend::dequantize_weights() {
             );
 
             output_weight_ = output_dequant_.data();
-            std::cout << "[cpu] output_weight dequantized: " << size << " elements\n";
-        } else {
-            std::cout << "[cpu] output_weight already F32 or tied\n";
         }
     }
 
-    // === OUTPUT NORM ===
+    /* ---- output norm ---- */
+
     if (output_norm_weight_) {
+
         auto type = model_.tensor_type("output_norm.weight");
+
         if (type != GgmlType::F32) {
-            std::cout << "[cpu] dequantizing output_norm\n";
+
             output_norm_dequant_.resize(config_.n_embd);
+
             ops::dequantize_auto(
                 output_norm_dequant_.data(),
                 output_norm_weight_,
                 config_.n_embd,
                 type
             );
+
             output_norm_weight_ = output_norm_dequant_.data();
         }
     }
 
-    // === LAYERS ===
-    std::cout << "[cpu] dequantizing " << config_.n_layers << " layers (this may take a while)...\n";
+    /* ---- layers ---- */
 
     for (uint32_t i = 0; i < config_.n_layers; ++i) {
-        auto& layer = layers_[i];
-        std::string prefix = "blk." + std::to_string(i) + ".";
 
-        // Helper lambda para dequantizar tensores
-        auto dequant_if_needed = [&](const float*& weight_ptr,
-                                      std::vector<float>& dequant_buffer,
-                                      const std::string& tensor_name,
-                                      size_t num_elements) {
-            if (!weight_ptr) return;
+        auto& L = layers_[i];
 
-            auto type = model_.tensor_type(tensor_name);
-            if (type != GgmlType::F32) {
-                dequant_buffer.resize(num_elements);
+        std::string p = "blk." + std::to_string(i) + ".";
+
+        auto dq = [&](const float*& w,
+                      std::vector<float>& buf,
+                      const std::string& name,
+                      size_t n) {
+
+            if (!w) return;
+
+            auto t = model_.tensor_type(name);
+
+            if (t != GgmlType::F32) {
+
+                buf.resize(n);
+
                 ops::dequantize_auto(
-                    dequant_buffer.data(),
-                    weight_ptr,
-                    num_elements,
-                    type
+                    buf.data(),
+                    w,
+                    n,
+                    t
                 );
-                weight_ptr = dequant_buffer.data();
+
+                w = buf.data();
             }
         };
 
-        // Attention norm
-        dequant_if_needed(
-            layer.attn_norm_weight,
-            layer.attn_norm_dequant,
-            prefix + "attn_norm.weight",
-            config_.n_embd
-        );
+        dq(L.attn_norm_weight, L.attn_norm_dequant,
+           p + "attn_norm.weight", config_.n_embd);
 
-        // Attention projections (Q, K, V, O)
-        dequant_if_needed(
-            layer.wq,
-            layer.wq_dequant,
-            prefix + "attn_q.weight",
-            config_.n_embd * config_.n_embd
-        );
+        dq(L.wq, L.wq_dequant, p + "attn_q.weight",
+           (size_t)config_.n_embd * config_.n_embd);
 
-        dequant_if_needed(
-            layer.wk,
-            layer.wk_dequant,
-            prefix + "attn_k.weight",
-            config_.n_embd * config_.n_embd
-        );
+        dq(L.wk, L.wk_dequant, p + "attn_k.weight",
+           (size_t)config_.n_embd * config_.n_embd);
 
-        dequant_if_needed(
-            layer.wv,
-            layer.wv_dequant,
-            prefix + "attn_v.weight",
-            config_.n_embd * config_.n_embd
-        );
+        dq(L.wv, L.wv_dequant, p + "attn_v.weight",
+           (size_t)config_.n_embd * config_.n_embd);
 
-        dequant_if_needed(
-            layer.wo,
-            layer.wo_dequant,
-            prefix + "attn_output.weight",
-            config_.n_embd * config_.n_embd
-        );
+        dq(L.wo, L.wo_dequant, p + "attn_output.weight",
+           (size_t)config_.n_embd * config_.n_embd);
 
-        // FFN norm
-        dequant_if_needed(
-            layer.ffn_norm_weight,
-            layer.ffn_norm_dequant,
-            prefix + "ffn_norm.weight",
-            config_.n_embd
-        );
+        dq(L.ffn_norm_weight, L.ffn_norm_dequant,
+           p + "ffn_norm.weight", config_.n_embd);
 
-        // FFN projections (w1, w2, w3)
-        const int ffn_dim = config_.n_embd * 4;  // Típico: 4x expansion
+        size_t ffn_dim = (size_t)config_.n_embd * 4;
 
-        dequant_if_needed(
-            layer.w1,
-            layer.w1_dequant,
-            prefix + "ffn_gate.weight",
-            ffn_dim * config_.n_embd
-        );
+        dq(L.w1, L.w1_dequant, p + "ffn_gate.weight",
+           ffn_dim * config_.n_embd);
 
-        dequant_if_needed(
-            layer.w2,
-            layer.w2_dequant,
-            prefix + "ffn_down.weight",
-            config_.n_embd * ffn_dim
-        );
+        dq(L.w2, L.w2_dequant, p + "ffn_down.weight",
+           config_.n_embd * ffn_dim);
 
-        dequant_if_needed(
-            layer.w3,
-            layer.w3_dequant,
-            prefix + "ffn_up.weight",
-            ffn_dim * config_.n_embd
-        );
-
-        // Progress update a cada 5 layers
-        if ((i + 1) % 5 == 0 || i == 0) {
-            std::cout << "[cpu] dequantized " << (i + 1) << "/"
-                      << config_.n_layers << " layers\n";
-        }
+        dq(L.w3, L.w3_dequant, p + "ffn_up.weight",
+           ffn_dim * config_.n_embd);
     }
 
-    std::cout << "[cpu] all layers dequantized successfully\n";
-    std::cout << "[cpu] dequantization complete\n";
+    std::cout << "[cpu] dequant done\n";
 }
 
-// ============================================================================
-// EXTRAÇÃO DE PESOS
-// ============================================================================
+/* ================================================= */
+/* EXTRACT */
+/* ================================================= */
 
 void CpuBackend::extract_weights() {
-    // Embedding
-    token_embd_weight_ = static_cast<const float*>(
-        model_.tensor_ptr("token_embd.weight")
-    );
 
-    // Output
-    output_norm_weight_ = static_cast<const float*>(
-        model_.tensor_ptr("output_norm.weight")
-    );
+    token_embd_weight_ = (const float*)
+        model_.tensor_ptr("token_embd.weight");
 
-    output_weight_ = static_cast<const float*>(
-        model_.tensor_ptr("output.weight")
-    );
+    output_norm_weight_ = (const float*)
+        model_.tensor_ptr("output_norm.weight");
 
-    // Se não encontrar output.weight, tenta lm_head
+    output_weight_ = (const float*)
+        model_.tensor_ptr("output.weight");
+
     if (!output_weight_) {
-        output_weight_ = static_cast<const float*>(
-            model_.tensor_ptr("lm_head.weight")
-        );
+        output_weight_ = (const float*)
+            model_.tensor_ptr("lm_head.weight");
     }
 
-    // Layers
     layers_.resize(config_.n_layers);
 
     for (uint32_t i = 0; i < config_.n_layers; ++i) {
-        auto& layer = layers_[i];
-        std::string prefix = "blk." + std::to_string(i) + ".";
 
-        // Attention norm
-        layer.attn_norm_weight = static_cast<const float*>(
-            model_.tensor_ptr(prefix + "attn_norm.weight")
-        );
+        auto& L = layers_[i];
 
-        // Projections Q, K, V, O
-        layer.wq = static_cast<const float*>(
-            model_.tensor_ptr(prefix + "attn_q.weight")
-        );
+        std::string p = "blk." + std::to_string(i) + ".";
 
-        layer.wk = static_cast<const float*>(
-            model_.tensor_ptr(prefix + "attn_k.weight")
-        );
+        L.attn_norm_weight = (const float*)
+            model_.tensor_ptr(p + "attn_norm.weight");
 
-        layer.wv = static_cast<const float*>(
-            model_.tensor_ptr(prefix + "attn_v.weight")
-        );
+        L.wq = (const float*)model_.tensor_ptr(p + "attn_q.weight");
+        L.wk = (const float*)model_.tensor_ptr(p + "attn_k.weight");
+        L.wv = (const float*)model_.tensor_ptr(p + "attn_v.weight");
+        L.wo = (const float*)model_.tensor_ptr(p + "attn_output.weight");
 
-        layer.wo = static_cast<const float*>(
-            model_.tensor_ptr(prefix + "attn_output.weight")
-        );
+        L.ffn_norm_weight = (const float*)
+            model_.tensor_ptr(p + "ffn_norm.weight");
 
-        // FFN norm
-        layer.ffn_norm_weight = static_cast<const float*>(
-            model_.tensor_ptr(prefix + "ffn_norm.weight")
-        );
-
-        // FFN projections
-        layer.w1 = static_cast<const float*>(
-            model_.tensor_ptr(prefix + "ffn_gate.weight")
-        );
-
-        layer.w2 = static_cast<const float*>(
-            model_.tensor_ptr(prefix + "ffn_down.weight")
-        );
-
-        layer.w3 = static_cast<const float*>(
-            model_.tensor_ptr(prefix + "ffn_up.weight")
-        );
+        L.w1 = (const float*)model_.tensor_ptr(p + "ffn_gate.weight");
+        L.w2 = (const float*)model_.tensor_ptr(p + "ffn_down.weight");
+        L.w3 = (const float*)model_.tensor_ptr(p + "ffn_up.weight");
     }
 
     std::cout << "[cpu] weights extracted\n";
 }
 
-// ============================================================================
-// INICIALIZAÇÃO ROPE
-// ============================================================================
-
-void CpuBackend::init_rope_freqs() {
-    const int head_dim = config_.n_embd / config_.n_heads;
-    const int half_dim = head_dim / 2;
-
-    for (uint32_t i = 0; i < config_.n_layers; ++i) {
-        auto& layer = layers_[i];
-        layer.rope_freqs.resize(half_dim);
-
-        for (int d = 0; d < half_dim; ++d) {
-            float freq = 1.0f / std::pow(
-                config_.rope_freq_base,
-                static_cast<float>(2 * d) / head_dim
-            );
-            layer.rope_freqs[d] = freq;
-        }
-    }
-}
-
-// ============================================================================
-// FORWARD PASS (1 token)
-// ============================================================================
+/* ================================================= */
+/* FORWARD TOKEN */
+/* ================================================= */
 
 void CpuBackend::forward(const TensorView& in, TensorView& out) {
+
     auto t0 = std::chrono::steady_clock::now();
 
-    if (!in.data || !out.data) {
-        std::cerr << "[cpu] forward: NULL tensors\n";
-        return;
-    }
+    int32_t token_id = *(int32_t*)in.data;
+    float* logits = (float*)out.data;
 
-    int32_t token_id = *static_cast<const int32_t*>(in.data);
-    float* logits = static_cast<float*>(out.data);
-
-    // Verifica bounds
-    if (token_id < 0 || static_cast<uint32_t>(token_id) >= config_.n_vocab) {
-        std::cerr << "[cpu] token_id out of range: " << token_id << "\n";
+    if (token_id < 0 || token_id >= (int32_t)config_.n_vocab) {
         ops::fill_f32(logits, 0.0f, config_.n_vocab);
         return;
     }
 
-    // 1. Embedding
-    if (token_embd_weight_) {
-        const float* emb = token_embd_weight_ + (token_id * config_.n_embd);
-        ops::copy_f32(hidden_buf_.data(), emb, config_.n_embd);
-    } else {
-        ops::fill_f32(hidden_buf_.data(), 0.0f, config_.n_embd);
-    }
+    /* ---- embedding ---- */
 
-    // 2. Process all transformer layers
+    const float* emb = token_embd_weight_ +
+                       token_id * config_.n_embd;
+
+    ops::copy_f32(hidden_buf_.data(), emb, config_.n_embd);
+
+    /* ---- transformer ---- */
+
     for (uint32_t i = 0; i < config_.n_layers; ++i) {
         forward_layer(i, hidden_buf_.data(), 1);
     }
 
-    // 3. Norm
+    /* ---- norm ---- */
+
     if (output_norm_weight_) {
         ops::rms_norm_f32(
-            hidden_buf_.data(), hidden_buf_.data(),
-            output_norm_weight_, config_.n_embd
-        );
-    }
-
-    // 4. Output projection
-    if (output_weight_) {
-        std::cout << "[cpu] calling matmul: M=1, N=" << config_.n_vocab
-                  << ", K=" << config_.n_embd << "\n";
-
-        ops::matmul_f32(
             hidden_buf_.data(),
-            output_weight_,
-            logits,
-            1, config_.n_vocab, config_.n_embd
+            hidden_buf_.data(),
+            output_norm_weight_,
+            config_.n_embd
         );
-    } else {
-        ops::fill_f32(logits, 0.0f, config_.n_vocab);
     }
+
+    /* ---- output ---- */
+
+    ops::matmul_f32(
+        hidden_buf_.data(),
+        output_weight_,
+        logits,
+        1,
+        config_.n_vocab,
+        config_.n_embd
+    );
 
     kv_pos_++;
 
@@ -445,168 +330,131 @@ void CpuBackend::forward(const TensorView& in, TensorView& out) {
 
     last_stats_.exec_time_ms +=
         std::chrono::duration<double, std::milli>(t1 - t0).count();
-    last_stats_.tokens_total += 1;
+
+    last_stats_.tokens_total++;
 }
 
-// ============================================================================
-// FORWARD LAYER
-// ============================================================================
+/* ================================================= */
+/* LAYER */
+/* ================================================= */
 
-void CpuBackend::forward_layer(int layer_idx, float* hidden, int seq_len) {
-    const auto& layer = layers_[layer_idx];
+void CpuBackend::forward_layer(int idx, float* hidden, int seq_len) {
 
-    // Residual connection
+    auto& L = layers_[idx];
+
     std::vector<float> residual(config_.n_embd);
     ops::copy_f32(residual.data(), hidden, config_.n_embd);
 
-    // 1. Attention
-    forward_attention(layer, hidden, seq_len);
+    forward_attention(L, hidden, seq_len);
 
-    // Add residual
     ops::add_f32(hidden, residual.data(), config_.n_embd);
 
-    // Save new residual
     ops::copy_f32(residual.data(), hidden, config_.n_embd);
 
-    // 2. FFN
-    forward_ffn(layer, hidden, seq_len);
+    forward_ffn(L, hidden, seq_len);
 
-    // Add residual
     ops::add_f32(hidden, residual.data(), config_.n_embd);
 }
 
-// continua na próxima parte...
-// Continuação de cpu_backend.cpp
-
-// ============================================================================
-// ATTENTION (simplificado - sem GQA por enquanto)
-// ============================================================================
+/* ================================================= */
+/* ATTENTION */
+/* ================================================= */
 
 void CpuBackend::forward_attention(
-    const TransformerLayer& layer,
+    const TransformerLayer& L,
     float* hidden,
     int seq_len
 ) {
-    const int head_dim = config_.n_embd / config_.n_heads;
 
-    // RMS Norm
-    if (layer.attn_norm_weight) {
+    if (L.attn_norm_weight) {
         ops::rms_norm_f32(
             hidden, hidden,
-            layer.attn_norm_weight,
-            config_.n_embd,
-            config_.rms_norm_eps
+            L.attn_norm_weight,
+            config_.n_embd
         );
     }
 
-    // Buffers para Q, K, V
     std::vector<float> Q(config_.n_embd);
     std::vector<float> K(config_.n_embd);
     std::vector<float> V(config_.n_embd);
 
-    // Projeções Q, K, V
-    if (layer.wq) {
-        ops::matmul_f32(hidden, layer.wq, Q.data(),
-                       seq_len, config_.n_embd, config_.n_embd);
-    }
+    ops::matmul_f32(hidden, L.wq, Q.data(),
+                   seq_len, config_.n_embd, config_.n_embd);
 
-    if (layer.wk) {
-        ops::matmul_f32(hidden, layer.wk, K.data(),
-                       seq_len, config_.n_embd, config_.n_embd);
-    }
+    ops::matmul_f32(hidden, L.wk, K.data(),
+                   seq_len, config_.n_embd, config_.n_embd);
 
-    if (layer.wv) {
-        ops::matmul_f32(hidden, layer.wv, V.data(),
-                       seq_len, config_.n_embd, config_.n_embd);
-    }
+    ops::matmul_f32(hidden, L.wv, V.data(),
+                   seq_len, config_.n_embd, config_.n_embd);
 
-    // RoPE (Rotary Position Embedding)
-    if (!layer.rope_freqs.empty()) {
-        ops::rope_f32(
-            Q.data(), layer.rope_freqs.data(),
-            seq_len, config_.n_heads, head_dim,
-            kv_pos_
-        );
+    std::vector<float> out(config_.n_embd);
 
-        ops::rope_f32(
-            K.data(), layer.rope_freqs.data(),
-            seq_len, config_.n_heads, head_dim,
-            kv_pos_
-        );
-    }
-
-    // FASE 3 Simplificada: Attention sem KV cache
-    // FASE 4: Implementar KV cache completo
-
-    std::vector<float> attn_out(config_.n_embd);
     ops::attention_f32(
-        attn_out.data(),
+        out.data(),
         Q.data(), K.data(), V.data(),
         seq_len, config_.n_embd
     );
 
-    // Output projection
-    if (layer.wo) {
-        ops::matmul_f32(
-            attn_out.data(), layer.wo, hidden,
-            seq_len, config_.n_embd, config_.n_embd
-        );
-    } else {
-        ops::copy_f32(hidden, attn_out.data(), config_.n_embd);
-    }
+    ops::matmul_f32(
+        out.data(), L.wo, hidden,
+        seq_len, config_.n_embd, config_.n_embd
+    );
 }
 
-// ============================================================================
-// FFN (Feed-Forward Network)
-// ============================================================================
+/* ================================================= */
+/* FFN */
+/* ================================================= */
 
 void CpuBackend::forward_ffn(
-    const TransformerLayer& layer,
+    const TransformerLayer& L,
     float* hidden,
     int seq_len
 ) {
-    // RMS Norm
-    if (layer.ffn_norm_weight) {
+
+    if (L.ffn_norm_weight) {
         ops::rms_norm_f32(
             hidden, hidden,
-            layer.ffn_norm_weight,
-            config_.n_embd,
-            config_.rms_norm_eps
+            L.ffn_norm_weight,
+            config_.n_embd
         );
     }
 
-    // FFN dimension (tipicamente 4 * n_embd ou similar)
-    const int ffn_dim = config_.n_embd * 4;  // TODO: extrair do GGUF
+    int ffn_dim = config_.n_embd * 4;
 
     std::vector<float> gate(ffn_dim);
     std::vector<float> up(ffn_dim);
 
-    // Gate projection + SiLU
-    if (layer.w1) {
-        ops::matmul_f32(hidden, layer.w1, gate.data(),
-                       seq_len, ffn_dim, config_.n_embd);
-        ops::silu_f32(gate.data(), ffn_dim);
-    }
+    ops::matmul_f32(hidden, L.w1, gate.data(),
+                   seq_len, ffn_dim, config_.n_embd);
 
-    // Up projection
-    if (layer.w3) {
-        ops::matmul_f32(hidden, layer.w3, up.data(),
-                       seq_len, ffn_dim, config_.n_embd);
-    }
+    ops::silu_f32(gate.data(), ffn_dim);
 
-    // Element-wise multiply
+    ops::matmul_f32(hidden, L.w3, up.data(),
+                   seq_len, ffn_dim, config_.n_embd);
+
     ops::mul_f32(gate.data(), gate.data(), up.data(), ffn_dim);
 
-    // Down projection
-    if (layer.w2) {
-        ops::matmul_f32(gate.data(), layer.w2, hidden,
-                       seq_len, config_.n_embd, ffn_dim);
-    }
+    ops::matmul_f32(
+        gate.data(), L.w2, hidden,
+        seq_len, config_.n_embd, ffn_dim
+    );
 }
 
-// ============================================================================
-// GERAÇÃO DE TEXTO
-// ============================================================================
+/* ================================================= */
+/* STATS */
+/* ================================================= */
+
+BackendStats CpuBackend::stats() const {
+
+    BackendStats s = last_stats_;
+
+    if (s.exec_time_ms > 0) {
+        s.tokens_per_sec =
+            (s.tokens_total * 1000.0) / s.exec_time_ms;
+    }
+
+    return s;
+}
 
 std::string CpuBackend::generate(
     const std::string& prompt,
@@ -615,95 +463,63 @@ std::string CpuBackend::generate(
 ) {
     std::cout << "[cpu] generating from prompt: \"" << prompt << "\"\n";
 
-    // 1. Tokeniza prompt
-    auto tokens = tokenizer_->encode(prompt);
+    // Se ainda não tem tokenizer real, placeholder simples:
+    // (isso vai ser substituído pelo GGUF tokenizer depois)
 
-    std::cout << "[cpu] prompt tokens: " << tokens.size() << "\n";
+    std::vector<int32_t> tokens;
 
-    // 2. Processa prompt (prefill)
-    // FASE 3: Processa token por token (ineficiente)
-    // FASE 4: Batch prefill
+    // Hack temporário: usa token 1 como start
+    tokens.push_back(1);
 
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        TensorView in_view;
-        in_view.data = &tokens[i];
+    // Prefill
+    for (int32_t t : tokens) {
+        TensorView in;
+        in.data = &t;
 
-        TensorView out_view;
-        out_view.data = logits_buf_.data();
+        TensorView out;
+        out.data = logits_buf_.data();
 
-        forward(in_view, out_view);
+        forward(in, out);
     }
 
-    // 3. Geração autoregressiva
-    std::vector<int32_t> generated_tokens;
-
-    sampler_ = std::make_unique<Sampler>(sampling);
+    std::vector<int32_t> generated;
 
     for (int i = 0; i < max_tokens; ++i) {
-        // Sample próximo token
-        int32_t next_token = sampler_->sample(
-            logits_buf_.data(),
-            config_.n_vocab
-        );
 
-        // Verifica EOS
-        if (next_token == tokenizer_->eos_token()) {
-            std::cout << "[cpu] EOS token generated\n";
-            break;
+        int32_t next = 0;
+
+        // argmax simples (temporário, depois entra sampler real)
+        float best = logits_buf_[0];
+
+        for (uint32_t j = 1; j < config_.n_vocab; ++j) {
+            if (logits_buf_[j] > best) {
+                best = logits_buf_[j];
+                next = j;
+            }
         }
 
-        generated_tokens.push_back(next_token);
+        generated.push_back(next);
 
-        // Forward pass com novo token
-        TensorView in_view;
-        in_view.data = &next_token;
+        TensorView in;
+        in.data = &next;
 
-        TensorView out_view;
-        out_view.data = logits_buf_.data();
+        TensorView out;
+        out.data = logits_buf_.data();
 
-        forward(in_view, out_view);
+        forward(in, out);
     }
 
-    std::cout << "[cpu] generated " << generated_tokens.size() << " tokens\n";
+    std::cout << "[cpu] generated " << generated.size() << " tokens\n";
 
-    // 4. Detokeniza
-    std::string result = tokenizer_->decode(generated_tokens);
+    // Sem tokenizer real ainda → retorna ids como string
+
+    std::string result;
+    for (auto t : generated) {
+        result += "[" + std::to_string(t) + "]";
+    }
 
     return result;
 }
 
-// ============================================================================
-// ESTATÍSTICAS
-// ============================================================================
-
-BackendStats CpuBackend::stats() const {
-    BackendStats s = last_stats_;
-
-    // Calcula tokens/sec
-    if (s.exec_time_ms > 0) {
-        s.tokens_per_sec = (s.tokens_total * 1000.0) / s.exec_time_ms;
-    }
-
-    // Métricas de energia
-    if (power_ok_) {
-        auto energy_end = power_.read_joules();
-        if (energy_end) {
-            double total_joules = *energy_end - energy_start_;
-            double time_seconds = s.exec_time_ms / 1000.0;
-
-            if (time_seconds > 0) {
-                s.watts_avg = total_joules / time_seconds;
-
-                if (s.watts_avg > 0) {
-                    s.tokens_per_watt = s.tokens_per_sec / s.watts_avg;
-                }
-            }
-
-            s.energy_total_joules = total_joules;
-        }
-    }
-
-    return s;
-}
 
 } // namespace engine

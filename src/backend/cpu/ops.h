@@ -15,7 +15,7 @@ void matmul_f32(const float* A, const float* B, float* C, int M, int N, int K);
 void add_f32(float* dst, const float* src, int n);
 void mul_f32(float* dst, const float* a, const float* b, int n);
 void copy_f32(float* dst, const float* src, int n);
-void fill_f32(float* dst, float value, int n);
+void fill_f32(float* dst, float value, size_t n);
 
 // ============================================================================
 // NORMALIZAÇÃO

@@ -67,7 +67,7 @@ struct ModelConfig {
 class CpuBackend final : public Backend {
 public:
     CpuBackend();
-    ~CpuBackend();
+
 
     void init() override;
     ModelInfo load_model(const std::string& model_path) override;
@@ -84,6 +84,8 @@ public:
         int max_tokens = 50,
         const SamplingConfig& sampling = {}
     );
+
+
 
     // Gera com configuração avançada
     std::string generate_advanced(

@@ -374,21 +374,32 @@ std::string SimpleTokenizer::decode(const std::vector<int32_t>& tokens) const {
     std::string result;
 
     for (int32_t token_id : tokens) {
-        // Skip special tokens
-        if (token_id == impl_->bos || token_id == impl_->eos || token_id == impl_->pad) {
+        // Ignora tokens especiais
+        if (token_id == impl_->bos ||
+            token_id == impl_->eos ||
+            token_id == impl_->pad) {
+            std::cout << "[tokenizer] skipping special token: " << token_id << "\n";
+            continue;
+        }
+
+        // Verifica bounds
+        if (token_id < 0 || static_cast<size_t>(token_id) >= impl_->bpe.vocab_size()) {
+            std::cout << "[tokenizer] WARNING: token_id " << token_id
+                      << " out of range (vocab=" << impl_->bpe.vocab_size() << ")\n";
+            result += "<unk>";
             continue;
         }
 
         const std::string& text = impl_->bpe.get_text(token_id);
+
+        // DEBUG: Mostrar o que está sendo decodificado
+        std::cout << "[tokenizer] token " << token_id << " -> '" << text << "'\n";
+
         if (!text.empty()) {
             result += text;
         } else {
-            // Fallback: character
-            if (token_id >= 3 && token_id < 259) {
-                result += static_cast<char>(token_id - 3);
-            } else {
-                result += "<unk>";
-            }
+            std::cout << "[tokenizer] WARNING: empty text for token " << token_id << "\n";
+            result += "<unk>";
         }
     }
 
