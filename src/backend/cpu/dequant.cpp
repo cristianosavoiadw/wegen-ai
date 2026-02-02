@@ -111,41 +111,43 @@ void dequantize_q8_0(float* dst, const void* src, int n) {
 // ============================================================================
 // DEQUANTIZAÇÃO Q6_K
 // ============================================================================
-
 void dequantize_q6_k(float* dst, const void* src, int n) {
     const int nb = n / QK_K;
+
+    if (n % QK_K != 0) {
+        std::cerr << "[dequant] WARNING: Q6_K n=" << n
+                  << " not multiple of " << QK_K << "\n";
+    }
+
     const block_q6_K* blocks = static_cast<const block_q6_K*>(src);
-    
+
     for (int b = 0; b < nb; ++b) {
         const block_q6_K& block = blocks[b];
-        const float d = block.d;
-        
-        // Q6_K divide em 16 grupos de 16 valores
+
+        // ✅ d é FP16 no ggml
+        const float d = read_fp16(block.d);
+
+        // 16 grupos * 16 valores = 256
         for (int group = 0; group < 16; ++group) {
-            const int8_t scale = block.scales[group];
-            
+            const float sc = static_cast<float>(block.scales[group]) * d;
+
             for (int i = 0; i < 16; ++i) {
-                int idx = group * 16 + i;
-                
-                // Combina lower 4 bits (ql) com upper 2 bits (qh)
-                int ql_idx = idx / 2;
-                int qh_idx = idx / 4;
-                
-                uint8_t ql = block.ql[ql_idx];
-                uint8_t qh = block.qh[qh_idx];
-                
-                // Extrai os bits corretos
-                int shift_l = (idx % 2) * 4;
-                int shift_h = (idx % 4) * 2;
-                
-                uint8_t q_low = (ql >> shift_l) & 0x0F;
-                uint8_t q_high = (qh >> shift_h) & 0x03;
-                
-                // Combina em 6 bits
-                int q = q_low | (q_high << 4);
-                
-                // Converte para float
-                dst[b * QK_K + idx] = (q - 32) * scale * d;
+                const int idx = group * 16 + i;
+
+                const int ql_idx = idx / 2;
+                const int qh_idx = idx / 4;
+
+                const uint8_t ql = block.ql[ql_idx];
+                const uint8_t qh = block.qh[qh_idx];
+
+                const int shift_l = (idx % 2) * 4;
+                const int shift_h = (idx % 4) * 2;
+
+                const uint8_t q_low  = (ql >> shift_l) & 0x0F;
+                const uint8_t q_high = (qh >> shift_h) & 0x03;
+
+                const int q = int(q_low | (q_high << 4)); // 0..63
+                dst[b * QK_K + idx] = (float(q) - 32.0f) * sc;
             }
         }
     }
@@ -162,52 +164,62 @@ void dequantize_q6_k(float* dst, const void* src, int n) {
         GgmlType type
     ) {
     switch (type) {
+
         case GgmlType::F32:
-            std::memcpy(dst, src, n * sizeof(float));
-            break;
+            std::memcpy(dst, src, (size_t)n * sizeof(float));
+            return;
 
         case GgmlType::F16: {
             const uint8_t* src_u8 = static_cast<const uint8_t*>(src);
             for (int i = 0; i < n; ++i) {
-                dst[i] = read_fp16(src_u8 + i * 2);
+                dst[i] = read_fp16(src_u8 + (size_t)i * 2);
             }
-            break;
+            return;
         }
+
+        case GgmlType::Q4_K:
+            dequantize_q4_k_m(dst, src, n);
+            return;
+
+        case GgmlType::Q6_K:
+            dequantize_q6_k(dst, src, n);
+            return;
+
+        case GgmlType::Q8_0:
+            dequantize_q8_0(dst, src, n);
+            return;
+
+            // ===== NÃO SUPORTADOS (NÃO MINTA MAPEANDO ERRADO) =====
 
         case GgmlType::Q4_0:
         case GgmlType::Q4_1:
-        case GgmlType::Q4_K:    // ← TIPO 12
-            dequantize_q4_k_m(dst, src, n);
-            break;
+            std::cerr << "[dequant] Q4_0/Q4_1 not supported (would corrupt)\n";
+            std::memset(dst, 0, (size_t)n * sizeof(float));
+            return;
 
-        case GgmlType::Q6_K:    // ← TIPO 14
-            dequantize_q6_k(dst, src, n);
-            break;
-
-        case GgmlType::Q8_0:
         case GgmlType::Q8_1:
-            dequantize_q8_0(dst, src, n);
-            break;
+            std::cerr << "[dequant] Q8_1 not supported (different layout)\n";
+            std::memset(dst, 0, (size_t)n * sizeof(float));
+            return;
 
         case GgmlType::Q5_0:
         case GgmlType::Q5_1:
         case GgmlType::Q5_K:
-            std::cerr << "[dequant] Q5 not implemented yet, using zeros\n";
-            std::memset(dst, 0, n * sizeof(float));
-            break;
-
         case GgmlType::Q2_K:
         case GgmlType::Q3_K:
         case GgmlType::Q8_K:
-            std::cerr << "[dequant] Type " << static_cast<int>(type)
-                      << " not implemented yet, using zeros\n";
-            std::memset(dst, 0, n * sizeof(float));
-            break;
+        case GgmlType::IQ2_XXS:
+        case GgmlType::IQ2_XS:
+            std::cerr << "[dequant] type " << static_cast<int>(type)
+                      << " not implemented, returning zeros\n";
+            std::memset(dst, 0, (size_t)n * sizeof(float));
+            return;
 
         default:
-            std::cerr << "[dequant] Unknown type: " << static_cast<int>(type) << "\n";
-            std::memset(dst, 0, n * sizeof(float));
-            break;
+            std::cerr << "[dequant] unknown type " << static_cast<int>(type)
+                      << ", returning zeros\n";
+            std::memset(dst, 0, (size_t)n * sizeof(float));
+            return;
     }
 }
 

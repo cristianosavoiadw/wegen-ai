@@ -28,14 +28,14 @@ struct block_q8_0 {
 
 static_assert(sizeof(block_q8_0) == 4 + 32, "Wrong Q8_0 block size");
 
-struct block_q6_K {
-    uint8_t ql[QK_K/2];
-    uint8_t qh[QK_K/4];
-    int8_t  scales[QK_K/16];
-    float d;
-};
+    struct block_q6_K {
+        uint8_t ql[QK_K/2];        // 128
+        uint8_t qh[QK_K/4];        // 64
+        int8_t  scales[QK_K/16];   // 16
+        uint8_t d[2];              // FP16 (2 bytes)
+    };
 
-static_assert(sizeof(block_q6_K) == 128 + 64 + 16 + 4, "Wrong Q6_K block size");
+    static_assert(sizeof(block_q6_K) == 128 + 64 + 16 + 2, "Wrong Q6_K block size");
 
 // FP16 → FP32 conversão (CORRIGIDA)
 inline float fp16_to_fp32(uint16_t h) {

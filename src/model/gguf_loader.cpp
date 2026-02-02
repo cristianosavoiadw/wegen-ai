@@ -1,4 +1,4 @@
-#include "gguf_loader.h"
+#include "model/gguf_loader.h"
 
 #include <cstring>
 #include <sstream>
@@ -147,6 +147,8 @@ std::string GgufModel::summary() const {
     oss<<"GGUF model: ctx="<<context_length_
        <<" emb="<<embedding_dim_
        <<" layers="<<n_layers_
+       <<" vocab="<<vocab_size_
+       <<" heads="<<n_heads_
        <<" tensors="<<tensors_.size()
        <<" file_size="<<file_size_;
     return oss.str();
@@ -162,7 +164,6 @@ void GgufLoader::validate_magic(const char magic[4]) {
         throw std::runtime_error("GGUF: invalid magic");
     }
 }
-
 
 /* ================================================= */
 
@@ -216,6 +217,15 @@ GgufModel GgufLoader::load(const std::string& path){
         if(key=="llama.block_count"||key=="n_layer"){
             model.n_layers_=read_value_as_u32(p,end,t); continue;
         }
+        if(key=="llama.vocab_size"){
+            model.vocab_size_=read_value_as_u32(p,end,t); continue;
+        }
+        if(key=="llama.attention.head_count"||key=="n_head"){
+            model.n_heads_=read_value_as_u32(p,end,t); continue;
+        }
+        if(key=="llama.attention.head_count_kv"){
+            model.n_kv_heads_=read_value_as_u32(p,end,t); continue;
+        }
 
         /* ---- tokenizer ---- */
 
@@ -259,6 +269,35 @@ GgufModel GgufLoader::load(const std::string& path){
     uint64_t cur=(uint64_t)(p-(const uint8_t*)base);
     model.data_offset_=align_up(cur,GGUF_ALIGNMENT);
     model.data_base_=(const uint8_t*)base + model.data_offset_;
+
+    /* ================= FALLBACKS ================= */
+
+    if (model.vocab_size_ == 0) {
+        auto* emb_info = model.tensor_info("token_embd.weight");
+        if (emb_info && emb_info->n_dims >= 2) {
+            model.vocab_size_ = emb_info->dims[1];
+            std::cout << "[gguf] inferred vocab_size=" << model.vocab_size_
+                      << " from token_embd shape\n";
+        }
+    }
+
+    if (model.n_heads_ == 0 && model.embedding_dim_ > 0) {
+        model.n_heads_ = model.embedding_dim_ / 128;
+        if (model.n_heads_ == 0) {
+            model.n_heads_ = model.embedding_dim_ / 64;
+        }
+        if (model.n_heads_ > 0) {
+            std::cout << "[gguf] inferred n_heads=" << model.n_heads_ << "\n";
+        }
+    }
+
+    if (model.n_kv_heads_ == 0 && model.n_heads_ > 0) {
+        model.n_kv_heads_ = model.n_heads_ / 4;
+        if (model.n_kv_heads_ == 0) {
+            model.n_kv_heads_ = model.n_heads_;
+        }
+        std::cout << "[gguf] inferred n_kv_heads=" << model.n_kv_heads_ << "\n";
+    }
 
     return model;
 

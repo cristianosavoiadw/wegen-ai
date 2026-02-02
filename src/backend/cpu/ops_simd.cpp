@@ -167,7 +167,6 @@ void scale_f32_simd(float* dst, const float* src, float scale, int n) {
 // ============================================================================
 // RMS NORM
 // ============================================================================
-
 void rms_norm_f32_simd(
     float* out,
     const float* in,
@@ -196,9 +195,40 @@ void rms_norm_f32_simd(
         sum_sq += in[i] * in[i];
     }
 
-    // RMS
-    float rms = std::sqrt(sum_sq / n + eps);
+    // RMS com proteção contra NaN/Inf
+    float mean_sq = sum_sq / n;
+    float rms_sq = mean_sq + eps;
+
+    // PROTEÇÃO: Se rms_sq ainda for muito pequeno ou negativo
+    if (rms_sq <= 0.0f || std::isnan(rms_sq) || std::isinf(rms_sq)) {
+        std::cerr << "[ERROR] Invalid RMS: sum_sq=" << sum_sq
+                  << " n=" << n << " eps=" << eps << "\n";
+        // Fallback: copiar input
+        for (int j = 0; j < n; ++j) {
+            out[j] = in[j] * weight[j];
+        }
+        return;
+    }
+
+    float rms = std::sqrt(rms_sq);
+
+    // PROTEÇÃO: Se rms for muito pequeno, evitar divisão problemática
+    if (rms < 1e-12f) {
+        rms = 1e-12f;
+    }
+
     float scale = 1.0f / rms;
+
+    // Verificar se scale é válido
+    if (std::isnan(scale) || std::isinf(scale)) {
+        std::cerr << "[ERROR] Invalid scale: " << scale
+                  << " (rms=" << rms << ")\n";
+        for (int j = 0; j < n; ++j) {
+            out[j] = in[j] * weight[j];
+        }
+        return;
+    }
+
     __m256 scale_vec = _mm256_set1_ps(scale);
 
     // Normalize and apply weight

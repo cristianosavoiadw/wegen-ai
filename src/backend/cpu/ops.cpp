@@ -9,21 +9,26 @@ namespace ops {
 // ============================================================================
 // MATMUL
 // ============================================================================
-
 void matmul_f32(
     const float* A, const float* B, float* C,
     int M, int N, int K
 ) {
-    // Implementação básica (não otimizada)
-    // Versão futura: usar BLAS ou vetorização AVX2
-    
+    // A: row-major (M x K)
+    // B: ggml layout (ne0=K, ne1=N) => B[k + K*j]
+    // C: row-major (M x N)
+
     for (int i = 0; i < M; ++i) {
+        const float* arow = A + (size_t)i * K;
+
         for (int j = 0; j < N; ++j) {
+            const float* bcol = B + (size_t)K * j; // coluna j contígua em K
             float sum = 0.0f;
+
             for (int k = 0; k < K; ++k) {
-                sum += A[i * K + k] * B[k * N + j];
+                sum += arow[k] * bcol[k];
             }
-            C[i * N + j] = sum;
+
+            C[(size_t)i * N + j] = sum;
         }
     }
 }
